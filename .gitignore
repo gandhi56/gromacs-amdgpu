@@ -1,0 +1,6 @@
+# All heavy, regenerable artifacts: source clones, LLVM/GROMACS builds,
+# GROMACS installs, and simulation run outputs.
+.work/
+
+# Local secrets / path overrides.
+.env

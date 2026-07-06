@@ -1,0 +1,14 @@
+; ions.mdp — grompp input for ion placement (beclin1-blm)
+; Configurable values are substituted by prep-beclin1 at build time.
+integrator  = steep
+emtol       = @EM_TOL@
+emstep      = 0.01
+nsteps      = 50000
+
+nstlist         = 1
+cutoff-scheme   = Verlet
+ns_type         = grid
+coulombtype     = cutoff
+rcoulomb        = @RCOULOMB@
+rvdw            = @RVDW@
+pbc             = xyz

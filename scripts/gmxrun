@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# gmxrun <build> <system> [tag] [-- <extra mdrun args>]
+# Examples:
+#   gmxrun stable-rocm7.12 benchMEM
+#   gmxrun dev-current benchMEM patch1 -- -nsteps 50000
+#   gmxrun dev-current benchMEM prof -- --profile=trace -nsteps 10000
+#
+# Runs one simulation, writes result.json into the run dir. Paths from config.sh.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/config.sh"
+
+BUILD="${1:?build name (e.g. stable-rocm7.12 | dev-current | dev-llvm-...)}"
+SYSTEM="${2:?system name under \$SYSTEMS_DIR}"
+TAG="${3:-$(date +%H%M%S)}"
+shift $(( $# >= 3 ? 3 : $# ))
+[ "${1:-}" = "--" ] && shift || true
+
+GMX_PREFIX="$GMX_INSTALL_ROOT/${BUILD}"
+[ -d "$GMX_PREFIX" ] || { echo "no such build: $GMX_PREFIX"; exit 2; }
+
+SYS_DIR="$SYSTEMS_DIR/${SYSTEM}"
+[ -f "$SYS_DIR/topol.tpr" ] || { echo "no topol.tpr in $SYS_DIR"; exit 2; }
+
+RUN_DIR="$RUNS_DIR/${BUILD}__${SYSTEM}__${TAG}"
+mkdir -p "$RUN_DIR"
+cp "$SYS_DIR/topol.tpr" "$RUN_DIR/"
+cd "$RUN_DIR"
+
+PROFILE_MODE=""
+GPU_RESIDENCY=""
+EXTRA_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --profile=trace)    PROFILE_MODE=trace ;;
+    --profile=compute)  PROFILE_MODE=compute ;;
+    --full-gpu)         GPU_RESIDENCY="-nb gpu -pme gpu -pmefft gpu -bonded gpu -update gpu" ;;
+    --gpu-default)      GPU_RESIDENCY="" ;;
+    *)                  EXTRA_ARGS+=("$arg") ;;
+  esac
+done
+
+# Default to 40k steps if not overridden — long enough for PME tuning to settle.
+HAS_NSTEPS=0
+for arg in "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; do
+  [[ "$arg" == "-nsteps" ]] && HAS_NSTEPS=1
+done
+if [ "$HAS_NSTEPS" -eq 0 ]; then
+  EXTRA_ARGS+=(-nsteps 40000)
+fi
+
+# Pin to the discrete GPU only (skip an iGPU at device #1).
+export HIP_VISIBLE_DEVICES=0
+export ROCR_VISIBLE_DEVICES=0
+
+set +u; source "$GMX_PREFIX/bin/GMXRC"; set -u
+
+notify() {
+  if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d "$(jq -n --arg c "$1" '{content:$c}')" \
+      "$DISCORD_WEBHOOK_URL" >/dev/null || true
+  fi
+}
+
+VERSION=$(gmx --version 2>/dev/null | awk '/^GROMACS version:/{print $3}')
+notify "\`${BUILD}/${SYSTEM}/${TAG}\` started — \`${VERSION}\` on ${GPU_ARCH}"
+START=$(date +%s)
+
+MDRUN_ARGS=(mdrun -v -deffnm topol -ntmpi 1 -ntomp "$OMP_THREADS" -pin on -pinoffset 0 -pinstride 1 ${GPU_RESIDENCY} "${EXTRA_ARGS[@]}")
+case "$PROFILE_MODE" in
+  trace)
+    mkdir -p rocprof
+    rocprofv3 --hip-trace --kernel-trace --stats \
+      --output-format pftrace csv --output-directory rocprof \
+      -- gmx "${MDRUN_ARGS[@]}" 2>&1 | tee wall.log
+    RC=${PIPESTATUS[0]}
+    ;;
+  compute)
+    mkdir -p rocpc
+    rocprof-compute profile -n "${BUILD}_${SYSTEM}_${TAG}" --no-roof \
+      --path rocpc -- gmx "${MDRUN_ARGS[@]}" 2>&1 | tee wall.log
+    RC=${PIPESTATUS[0]}
+    ;;
+  *)
+    gmx "${MDRUN_ARGS[@]}" 2>&1 | tee wall.log
+    RC=${PIPESTATUS[0]}
+    ;;
+esac
+
+DUR=$(( $(date +%s) - START ))
+NSDAY=$(grep -oP 'Performance:\s+\K[\d.]+' topol.log 2>/dev/null | tail -1)
+FINISHED=$(grep -c "Finished mdrun" topol.log 2>/dev/null || echo 0)
+
+cat > "$RUN_DIR/result.json" <<JSON
+{
+  "build": "$BUILD",
+  "system": "$SYSTEM",
+  "tag": "$TAG",
+  "gmx_version": "$VERSION",
+  "duration_seconds": $DUR,
+  "ns_per_day": ${NSDAY:-null},
+  "return_code": $RC,
+  "finished": ${FINISHED},
+  "profile_mode": "${PROFILE_MODE:-none}",
+  "run_dir": "$RUN_DIR",
+  "timestamp": "$(date -Iseconds)"
+}
+JSON
+
+if [ "$RC" -eq 0 ] && [ "$FINISHED" -gt 0 ]; then
+  notify "\`${BUILD}/${SYSTEM}/${TAG}\` done in ${DUR}s — **${NSDAY:-?} ns/day**"
+else
+  TAIL=$(tail -c 1200 wall.log | sed 's/`/'\''/g')
+  notify "\`${BUILD}/${SYSTEM}/${TAG}\` FAILED rc=${RC} after ${DUR}s\n\`\`\`\n${TAIL}\n\`\`\`"
+fi
+exit "$RC"

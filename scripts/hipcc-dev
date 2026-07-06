@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# hipcc-dev - hipcc wrapper that forces the custom LLVM toolchain.
+# Paths come from config.sh so this stays relocatable.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/config.sh"
+
+exec env \
+  HIP_CLANG_PATH="$LLVM_BUILD/bin" \
+  PATH="$LLVM_BUILD/bin:$PATH" \
+  "$ROCM_ROOT/bin/hipcc" "$@"

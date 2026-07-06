@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# prep-beclin1 — one-time setup of the Beclin-1/BLM benchmark systems.
+#
+# Runs the full pdb2gmx -> solvate -> ions -> EM -> NVT -> NPT pipeline, then
+# installs topol.tpr for each stage into $SYSTEMS_DIR/{beclin1-em,-nvt,-npt}.
+# PDB and MDP templates ship in the repo under systems/beclin1/.
+#
+# After running once:
+#   bench-llvm-commit --system beclin1-nvt --tag my-tag
+#   gmxrun stable-rocm7.12 beclin1-npt smoke -- -nsteps 100
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/config.sh"
+
+# ---- defaults ----
+BUILD="$STABLE_BUILD"
+PDB="$HERE/systems/beclin1/beclin1-blm.pdb"
+MDP_DIR="$HERE/systems/beclin1/mdp"
+FORCEFIELD="15"
+WATER="spce"
+BOX_PADDING="2.0"
+TEMPERATURE="300"
+PRESSURE="1.0"
+EM_STEPS="50000"
+EM_TOL="1000.0"
+NVT_STEPS="50000"
+NPT_STEPS="50000"
+RCOULOMB="1.0"
+RVDW="1.0"
+
+# ---- arg parse ----
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --build)        BUILD="$2";        shift 2 ;;
+    --pdb)          PDB="$2";          shift 2 ;;
+    --mdp-dir)      MDP_DIR="$2";      shift 2 ;;
+    --forcefield)   FORCEFIELD="$2";   shift 2 ;;
+    --water)        WATER="$2";        shift 2 ;;
+    --box-padding)  BOX_PADDING="$2";  shift 2 ;;
+    --temperature)  TEMPERATURE="$2";  shift 2 ;;
+    --pressure)     PRESSURE="$2";     shift 2 ;;
+    --em-steps)     EM_STEPS="$2";     shift 2 ;;
+    --em-tol)       EM_TOL="$2";       shift 2 ;;
+    --nvt-steps)    NVT_STEPS="$2";    shift 2 ;;
+    --npt-steps)    NPT_STEPS="$2";    shift 2 ;;
+    --rcoulomb)     RCOULOMB="$2";     shift 2 ;;
+    --rvdw)         RVDW="$2";         shift 2 ;;
+    -h|--help)
+      echo "Usage: prep-beclin1 [options]"
+      echo "  --build NAME          GROMACS build to use for prep (default: $STABLE_BUILD)"
+      echo "  --pdb PATH            Source PDB (default: systems/beclin1/beclin1-blm.pdb)"
+      echo "  --mdp-dir PATH        MDP template dir (default: systems/beclin1/mdp)"
+      echo "  --forcefield N        pdb2gmx force field index (default: 15 = OPLS-AA/L)"
+      echo "  --water MODEL         Water model (default: spce)"
+      echo "  --box-padding DIST    Min protein->box edge in nm (default: 2.0)"
+      echo "  --temperature T       Reference temperature in K (default: 300)"
+      echo "  --pressure P          Reference pressure in bar (default: 1.0)"
+      echo "  --em-steps N          Max EM steps (default: 50000)"
+      echo "  --em-tol F            EM force tolerance kJ/mol/nm (default: 1000.0)"
+      echo "  --nvt-steps N         NVT mdrun steps (default: 50000)"
+      echo "  --npt-steps N         NPT mdrun steps (default: 50000)"
+      echo "  --rcoulomb R          Electrostatic cutoff nm (default: 1.0)"
+      echo "  --rvdw R              vdW cutoff nm (default: 1.0)"
+      exit 0 ;;
+    *) echo "unknown arg: $1"; exit 2 ;;
+  esac
+done
+
+GMX_PREFIX="$GMX_INSTALL_ROOT/${BUILD}"
+[ -d "$GMX_PREFIX" ] || { echo "error: no such build: $GMX_PREFIX"; exit 2; }
+[ -f "$PDB" ] || { echo "error: PDB not found: $PDB"; exit 2; }
+[ -d "$MDP_DIR" ] || { echo "error: mdp dir not found: $MDP_DIR"; exit 2; }
+
+PREP_DIR="$SYSTEMS_DIR/beclin1-prep"
+WORK_DIR_PREP="$PREP_DIR/work"
+
+mkdir -p "$WORK_DIR_PREP" \
+         "$SYSTEMS_DIR/beclin1-em" \
+         "$SYSTEMS_DIR/beclin1-nvt" \
+         "$SYSTEMS_DIR/beclin1-npt"
+
+set +u; source "$GMX_PREFIX/bin/GMXRC"; set -u
+
+render_mdp() {
+  local tmpl="$1" out="$2"
+  sed \
+    -e "s/@TEMPERATURE@/${TEMPERATURE}/g" \
+    -e "s/@PRESSURE@/${PRESSURE}/g" \
+    -e "s/@NVT_STEPS@/${NVT_STEPS}/g" \
+    -e "s/@NPT_STEPS@/${NPT_STEPS}/g" \
+    -e "s/@EM_STEPS@/${EM_STEPS}/g" \
+    -e "s/@EM_TOL@/${EM_TOL}/g" \
+    -e "s/@RCOULOMB@/${RCOULOMB}/g" \
+    -e "s/@RVDW@/${RVDW}/g" \
+    "$tmpl" > "$out"
+}
+
+cd "$WORK_DIR_PREP"
+
+echo "=== prep-beclin1: build=${BUILD} ff=${FORCEFIELD} water=${WATER} T=${TEMPERATURE}K P=${PRESSURE}bar ==="
+echo "    box_padding=${BOX_PADDING}nm  em_steps=${EM_STEPS} (tol=${EM_TOL})  nvt_steps=${NVT_STEPS}  npt_steps=${NPT_STEPS}"
+echo "    rcoulomb=${RCOULOMB}nm  rvdw=${RVDW}nm"
+echo ""
+
+echo "=== step 1: strip water from PDB ==="
+grep -v HOH "$PDB" > beclin1_clean.pdb
+
+echo "=== step 2: pdb2gmx (force field ${FORCEFIELD}, water ${WATER}) ==="
+echo "$FORCEFIELD" | gmx pdb2gmx -f beclin1_clean.pdb -o beclin1_processed.gro -water "$WATER" -missing
+
+echo "=== step 3: cubic simulation box (padding ${BOX_PADDING} nm) ==="
+gmx editconf -f beclin1_processed.gro -o beclin1_newbox.gro -c -d "$BOX_PADDING" -bt cubic
+
+echo "=== step 4: solvate ==="
+gmx solvate -cp beclin1_newbox.gro -cs spc216.gro -o beclin1_solv.gro -p topol.top
+
+echo "=== step 5: add ions (neutralise charge) ==="
+render_mdp "$MDP_DIR/ions.mdp" ions_rendered.mdp
+gmx grompp -f ions_rendered.mdp -c beclin1_solv.gro -p topol.top -o ions.tpr -maxwarn 1
+echo "SOL" | gmx genion -s ions.tpr -o beclin1_solv_ions.gro -p topol.top -pname NA -nname CL -neutral
+
+echo "=== step 6: build EM topology (beclin1-em) ==="
+render_mdp "$MDP_DIR/em.mdp" em_rendered.mdp
+gmx grompp -f em_rendered.mdp -c beclin1_solv_ions.gro -p topol.top -o em.tpr -maxwarn 1
+cp em.tpr "$SYSTEMS_DIR/beclin1-em/topol.tpr"
+echo "  -> installed $SYSTEMS_DIR/beclin1-em/topol.tpr"
+
+echo "=== step 7: run EM (produces em.gro for NVT starting coords) ==="
+gmx mdrun -v -deffnm em -ntmpi 1 -ntomp "$OMP_THREADS"
+
+echo "=== step 8: build NVT topology (beclin1-nvt) ==="
+render_mdp "$MDP_DIR/nvt.mdp" nvt_rendered.mdp
+gmx grompp -f nvt_rendered.mdp -c em.gro -r em.gro -p topol.top -o nvt.tpr -maxwarn 1
+cp nvt.tpr "$SYSTEMS_DIR/beclin1-nvt/topol.tpr"
+echo "  -> installed $SYSTEMS_DIR/beclin1-nvt/topol.tpr"
+
+echo "=== step 9: run NVT (produces nvt.gro + nvt.cpt for NPT starting coords) ==="
+gmx mdrun -v -deffnm nvt -ntmpi 1 -ntomp "$OMP_THREADS"
+
+echo "=== step 10: build NPT topology (beclin1-npt) ==="
+render_mdp "$MDP_DIR/npt.mdp" npt_rendered.mdp
+gmx grompp -f npt_rendered.mdp -c nvt.gro -r nvt.gro -t nvt.cpt -p topol.top -o npt.tpr -maxwarn 1
+cp npt.tpr "$SYSTEMS_DIR/beclin1-npt/topol.tpr"
+echo "  -> installed $SYSTEMS_DIR/beclin1-npt/topol.tpr"
+
+echo "=== writing prep.cfg ==="
+cat > "$PREP_DIR/prep.cfg" <<CFG
+# Generated by prep-beclin1 on $(date -Iseconds)
+BUILD=${BUILD}
+PDB=${PDB}
+FORCEFIELD=${FORCEFIELD}
+WATER=${WATER}
+BOX_PADDING=${BOX_PADDING}
+TEMPERATURE=${TEMPERATURE}
+PRESSURE=${PRESSURE}
+EM_STEPS=${EM_STEPS}
+EM_TOL=${EM_TOL}
+NVT_STEPS=${NVT_STEPS}
+NPT_STEPS=${NPT_STEPS}
+RCOULOMB=${RCOULOMB}
+RVDW=${RVDW}
+CFG
+
+echo ""
+echo "Done. Systems installed:"
+echo "  $SYSTEMS_DIR/beclin1-em/topol.tpr"
+echo "  $SYSTEMS_DIR/beclin1-nvt/topol.tpr"
+echo "  $SYSTEMS_DIR/beclin1-npt/topol.tpr"
+echo ""
+echo "Run benchmarks with:"
+echo "  bench-llvm-commit --no-llvm-rebuild --no-gmx-rebuild --system beclin1-nvt --tag baseline"
+echo "  kernel-bench $STABLE_BUILD beclin1-nvt kernel-baseline"

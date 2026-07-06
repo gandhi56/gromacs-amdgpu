@@ -1,0 +1,34 @@
+; nvt.mdp — NVT equilibration (beclin1-blm)
+; Configurable values are substituted by prep-beclin1 at build time.
+title                   = Beclin1-BLM NVT equilibration
+define                  = -DPOSRES
+integrator              = md
+nsteps                  = @NVT_STEPS@
+dt                      = 0.002
+nstxout                 = 500
+nstvout                 = 500
+nstenergy               = 500
+nstlog                  = 500
+continuation            = no
+constraint_algorithm    = lincs
+constraints             = h-bonds
+lincs_iter              = 1
+lincs_order             = 4
+cutoff-scheme           = Verlet
+ns_type                 = grid
+nstlist                 = 10
+rcoulomb                = @RCOULOMB@
+rvdw                    = @RVDW@
+DispCorr                = EnerPres
+coulombtype             = PME
+pme_order               = 4
+fourierspacing          = 0.16
+tcoupl                  = V-rescale
+tc-grps                 = Protein Non-Protein
+tau_t                   = 0.1     0.1
+ref_t                   = @TEMPERATURE@     @TEMPERATURE@
+pcoupl                  = no
+pbc                     = xyz
+gen_vel                 = yes
+gen_temp                = @TEMPERATURE@
+gen_seed                = -1

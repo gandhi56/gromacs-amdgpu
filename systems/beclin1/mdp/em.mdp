@@ -1,0 +1,14 @@
+; em.mdp — energy minimization (beclin1-blm)
+; Configurable values are substituted by prep-beclin1 at build time.
+integrator  = steep
+emtol       = @EM_TOL@
+emstep      = 0.01
+nsteps      = @EM_STEPS@
+
+nstlist         = 1
+cutoff-scheme   = Verlet
+ns_type         = grid
+coulombtype     = PME
+rcoulomb        = @RCOULOMB@
+rvdw            = @RVDW@
+pbc             = xyz

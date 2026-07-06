@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# kernel-bench <build> <system> [tag] [-- <extra mdrun args>]
+#
+# Wraps gmxrun with rocprofv3 tracing, parses per-kernel timings into
+# kernel_result.json, diffs against the stable kernel-baseline, posts to
+# Discord if configured. Paths from config.sh.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/config.sh"
+GMXRUN="$HERE/scripts/gmxrun"
+
+notify() {
+  if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d "$(jq -n --arg c "$1" '{content:$c}')" \
+      "$DISCORD_WEBHOOK_URL" >/dev/null || true
+  fi
+}
+
+BUILD="${1:?build}"
+SYSTEM="${2:?system}"
+TAG="${3:-$(date +%H%M%S)}"
+shift $(( $# >= 3 ? 3 : $# ))
+[ "${1:-}" = "--" ] && shift || true
+
+MAX_ATTEMPTS=3
+ATTEMPT=0
+while (( ATTEMPT < MAX_ATTEMPTS )); do
+  ATTEMPT=$(( ATTEMPT + 1 ))
+  echo "=== attempt $ATTEMPT/$MAX_ATTEMPTS ==="
+  if "$GMXRUN" "$BUILD" "$SYSTEM" "$TAG" -- --profile=trace "$@"; then
+    break
+  fi
+  if (( ATTEMPT == MAX_ATTEMPTS )); then
+    notify "kernel-bench ${BUILD}/${SYSTEM}/${TAG} failed after $MAX_ATTEMPTS attempts"
+    exit 1
+  fi
+  echo "run failed, retrying in 10s..."
+  sleep 10
+  rm -rf "$RUNS_DIR/${BUILD}__${SYSTEM}__${TAG}"
+done
+
+RUN_DIR="$RUNS_DIR/${BUILD}__${SYSTEM}__${TAG}"
+[ -d "$RUN_DIR/rocprof" ] || { echo "no rocprof dir at $RUN_DIR/rocprof"; exit 1; }
+
+CSV=$(ls "$RUN_DIR/rocprof"/*/*kernel_stats.csv 2>/dev/null | head -1)
+[ -z "$CSV" ] && CSV=$(ls "$RUN_DIR/rocprof"/*kernel_stats.csv 2>/dev/null | head -1)
+[ -z "$CSV" ] && { echo "no kernel CSV found"; find "$RUN_DIR/rocprof" -name '*.csv'; exit 1; }
+
+echo "Parsing: $CSV"
+
+python3 - "$CSV" "$RUN_DIR" <<'PY'
+import csv, json, sys, re
+
+csv_path, run_dir = sys.argv[1], sys.argv[2]
+
+with open(csv_path) as f:
+    rows = list(csv.DictReader(f))
+
+print(f"CSV columns: {list(rows[0].keys()) if rows else 'EMPTY'}", file=sys.stderr)
+
+def short_name(name):
+    name = re.sub(r'<[^<>]*>', '', name)
+    while '<' in name:
+        new = re.sub(r'<[^<>]*>', '', name)
+        if new == name: break
+        name = new
+    name = re.sub(r'\(.*$', '', name).strip()
+    name = name.split('::')[-1] if '::' in name else name
+    return name[:80]
+
+def categorize(name):
+    n = name.lower()
+    if 'nbnxm' in n:                       return 'nbnxm'
+    if 'splineandspread' in n:             return 'pme_spread'
+    if 'pmesolve' in n:                    return 'pme_solve'
+    if 'pmegather' in n:                   return 'pme_gather'
+    if 'lincs' in n:                       return 'lincs'
+    if 'settle' in n:                      return 'settle'
+    if 'leapfrog' in n or 'integrate' in n: return 'integrate'
+    if 'vkfft' in n or 'fft' in n:         return 'fft'
+    if 'reduce' in n:                      return 'reduce'
+    if 'copy' in n or 'fill' in n:         return 'memory'
+    return 'other'
+
+kernels = {}
+for r in rows:
+    name = r.get('Name', '')
+    if not name: continue
+    short = short_name(name)
+    calls = int(float(r.get('Calls', 0)))
+    total_ns = int(float(r.get('TotalDurationNs', 0)))
+    if short not in kernels:
+        kernels[short] = {'calls': 0, 'total_ns': 0, 'category': categorize(short)}
+    kernels[short]['calls'] += calls
+    kernels[short]['total_ns'] += total_ns
+
+for k in kernels.values():
+    k['avg_ns'] = k['total_ns'] // k['calls'] if k['calls'] else 0
+    k['ms_per_call'] = round(k['avg_ns'] / 1e6, 4)
+
+categories = {}
+for k in kernels.values():
+    cat = k['category']
+    categories.setdefault(cat, {'total_ns': 0, 'calls': 0})
+    categories[cat]['total_ns'] += k['total_ns']
+    categories[cat]['calls'] += k['calls']
+
+total_gpu_ns = sum(c['total_ns'] for c in categories.values())
+for c in categories.values():
+    c['ms_total'] = round(c['total_ns'] / 1e6, 3)
+    c['pct_gpu_time'] = round(100.0 * c['total_ns'] / total_gpu_ns, 2) if total_gpu_ns else 0
+
+out = {
+    'total_gpu_ms': round(total_gpu_ns / 1e6, 3),
+    'categories': categories,
+    'kernels': sorted(
+        [{'name': s, **k} for s, k in kernels.items()],
+        key=lambda x: -x['total_ns']),
+}
+
+with open(f"{run_dir}/kernel_result.json", "w") as f:
+    json.dump(out, f, indent=2)
+
+print(f"Wrote {run_dir}/kernel_result.json")
+print(f"Total GPU time: {out['total_gpu_ms']} ms")
+print(f"Top 5 categories by GPU time:")
+for name, c in sorted(out['categories'].items(), key=lambda x: -x[1]['total_ns'])[:5]:
+    print(f"  {name:15s}  {c['ms_total']:>10.3f} ms  ({c['pct_gpu_time']:>5.2f}%)  {c['calls']:>8d} calls")
+PY
+
+# ---- baseline diff ----
+BASELINE_DIR="$RUNS_DIR/${STABLE_BUILD}__${SYSTEM}__kernel-baseline"
+
+if [ "$TAG" = "kernel-baseline" ]; then
+    echo "(this is the kernel-baseline run — skipping diff)"
+    exit 0
+fi
+
+if [ ! -f "$BASELINE_DIR/kernel_result.json" ]; then
+    echo "(no kernel baseline at $BASELINE_DIR — run \`kernel-bench $STABLE_BUILD $SYSTEM kernel-baseline\` once)"
+    exit 0
+fi
+
+python3 - "$RUN_DIR/kernel_result.json" "$BASELINE_DIR/kernel_result.json" \
+          "$RUN_DIR/result.json" "$BUILD" "$SYSTEM" "$TAG" <<'PY'
+import json, sys, os, subprocess
+
+cur_p, base_p, result_p, build, system, tag = sys.argv[1:]
+with open(cur_p) as f: cur = json.load(f)
+with open(base_p) as f: base = json.load(f)
+
+ns_per_day = None
+if os.path.exists(result_p):
+    with open(result_p) as f:
+        ns_per_day = json.load(f).get('ns_per_day')
+
+lines = [f"**`{build}/{system}/{tag}`** kernel breakdown vs baseline"]
+if ns_per_day is not None:
+    lines.append(f"**{ns_per_day} ns/day**")
+order = ['nbnxm', 'pme_spread', 'pme_solve', 'pme_gather', 'fft',
+         'integrate', 'lincs', 'settle', 'memory', 'other']
+for cat in order:
+    if cat not in cur['categories']: continue
+    cur_ms = cur['categories'][cat]['ms_total']
+    base_ms = base.get('categories', {}).get(cat, {}).get('ms_total')
+    if base_ms is None or base_ms == 0:
+        lines.append(f"- `{cat}`: {cur_ms:.2f} ms (no baseline)"); continue
+    delta_pct = (cur_ms - base_ms) / base_ms * 100
+    lines.append(f"- `{cat}`: {cur_ms:.2f} ms ({delta_pct:+.2f}% vs {base_ms:.2f})")
+
+msg = "\n".join(lines)[:1900]
+print(msg)
+hook = os.environ.get('DISCORD_WEBHOOK_URL')
+if hook:
+    subprocess.run(
+        ['curl', '-s', '-X', 'POST',
+         '-H', 'Content-Type: application/json',
+         '-d', json.dumps({'content': msg}), hook],
+        timeout=10, check=False)
+PY

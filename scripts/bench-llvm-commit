@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# bench-llvm-commit [--no-llvm-rebuild] [--no-gmx-rebuild]
+#                   [--system NAME] [--tag TAG]
+#                   [--steps N] [--resetstep N]
+#
+# End-to-end: (re)build the custom LLVM + GROMACS dev build, run a benchmark,
+# stamp commit provenance into result.json, and diff ns/day against the stable
+# baseline. Delegates building to build-llvm.sh / build-gromacs.sh.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/config.sh"
+
+REBUILD_LLVM=1
+REBUILD_GMX=1
+SYSTEM="benchMEM"
+TAG=""
+STEPS=40000
+RESETSTEP=20000
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-llvm-rebuild) REBUILD_LLVM=0;    shift ;;
+    --no-gmx-rebuild)  REBUILD_GMX=0;     shift ;;
+    --system)          SYSTEM="$2";       shift 2 ;;
+    --tag)             TAG="$2";          shift 2 ;;
+    --steps)           STEPS="$2";        shift 2 ;;
+    --resetstep)       RESETSTEP="$2";    shift 2 ;;
+    -h|--help)
+      echo "Usage: bench-llvm-commit [--no-llvm-rebuild] [--no-gmx-rebuild]"
+      echo "                         [--system NAME] [--tag TAG]"
+      echo "                         [--steps N] [--resetstep N]"
+      echo "Defaults: --steps 40000 --resetstep 20000 --system benchMEM"
+      echo "Systems:  benchMEM benchRIB beclin1-em beclin1-nvt beclin1-npt"
+      exit 0 ;;
+    *) echo "unknown arg: $1"; exit 2 ;;
+  esac
+done
+
+if (( RESETSTEP >= STEPS )); then
+  echo "error: --resetstep $RESETSTEP must be less than --steps $STEPS"
+  exit 2
+fi
+MEASUREMENT_STEPS=$(( STEPS - RESETSTEP ))
+if (( MEASUREMENT_STEPS < 5000 )); then
+  echo "warning: only $MEASUREMENT_STEPS measurement steps — consider increasing --steps"
+fi
+
+notify() {
+  if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+    curl -s -X POST -H "Content-Type: application/json" \
+      -d "$(jq -n --arg c "$1" '{content:$c}')" \
+      "$DISCORD_WEBHOOK_URL" >/dev/null || true
+  fi
+}
+
+# ---- step 1: rebuild LLVM ----
+if [ "$REBUILD_LLVM" -eq 1 ]; then
+  echo "=== rebuilding LLVM ==="
+  if ! "$HERE/scripts/build-llvm.sh"; then
+    notify "LLVM build failed at \`$(git -C "$LLVM_DIR" rev-parse --short HEAD)\`"
+    exit 1
+  fi
+fi
+
+# ---- step 2: capture commit identity ----
+LLVM_HASH=$(git -C "$LLVM_DIR" rev-parse --short HEAD)
+LLVM_DIRTY=$(git -C "$LLVM_DIR" status --porcelain | wc -l)
+[ "$LLVM_DIRTY" -gt 0 ] && LLVM_HASH="${LLVM_HASH}-dirty"
+GMX_HASH=$(git -C "$GMX_SRC" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+[ -z "$TAG" ] && TAG="$LLVM_HASH"
+
+echo "LLVM commit:    $LLVM_HASH"
+echo "GROMACS commit: $GMX_HASH"
+echo "System:         $SYSTEM"
+echo "Tag:            $TAG"
+echo "Steps:          $STEPS (reset at $RESETSTEP, measuring $MEASUREMENT_STEPS)"
+
+# ---- step 3: rebuild GROMACS dev ----
+if [ "$REBUILD_GMX" -eq 1 ]; then
+  echo "=== rebuilding GROMACS dev ==="
+  if ! "$HERE/scripts/build-gromacs.sh" dev --clean; then
+    notify "GROMACS rebuild failed (LLVM \`$LLVM_HASH\`)"
+    exit 1
+  fi
+fi
+
+# ---- step 4: find dev build ----
+if [ ! -L "$GMX_INSTALL_ROOT/dev-current" ]; then
+  DEV_BUILD=$(ls -1t "$GMX_INSTALL_ROOT" | grep '^dev-' | head -1)
+else
+  DEV_BUILD=$(basename "$(readlink "$GMX_INSTALL_ROOT/dev-current")")
+fi
+[ -z "$DEV_BUILD" ] && { notify "no dev build found"; exit 1; }
+echo "Dev build:      $DEV_BUILD"
+
+# ---- step 5: run benchmark ----
+echo "=== running benchmark ==="
+"$HERE/scripts/kernel-bench" "$DEV_BUILD" "$SYSTEM" "$TAG" -- \
+  -nsteps "$STEPS" -resetstep "$RESETSTEP"
+
+# ---- step 6: stamp provenance into result.json ----
+RUN_DIR="$RUNS_DIR/${DEV_BUILD}__${SYSTEM}__${TAG}"
+[ -f "$RUN_DIR/result.json" ] || { notify "no result.json at $RUN_DIR"; exit 1; }
+
+jq --arg lh "$LLVM_HASH" --arg gh "$GMX_HASH" \
+   --argjson rs "$RESETSTEP" --argjson ns "$STEPS" \
+   '. + {llvm_commit: $lh, gromacs_commit: $gh,
+         nsteps: $ns, resetstep: $rs,
+         measurement_steps: ($ns - $rs)}' \
+   "$RUN_DIR/result.json" > "$RUN_DIR/result.json.tmp" \
+   && mv "$RUN_DIR/result.json.tmp" "$RUN_DIR/result.json"
+
+# ---- step 7: diff against baseline ----
+BASELINE_DIR="$RUNS_DIR/${STABLE_BUILD}__${SYSTEM}__baseline"
+DEV_NS=$(jq -r .ns_per_day "$RUN_DIR/result.json")
+
+if [ ! -f "$BASELINE_DIR/result.json" ]; then
+  notify "LLVM \`$LLVM_HASH\` on \`$SYSTEM\`: **${DEV_NS} ns/day** (no baseline — run \`gmxrun $STABLE_BUILD $SYSTEM baseline -- -nsteps $STEPS -resetstep $RESETSTEP\` once)"
+  exit 0
+fi
+
+BASE_NS=$(jq -r .ns_per_day "$BASELINE_DIR/result.json")
+DELTA=$(awk -v a="$DEV_NS" -v b="$BASE_NS" 'BEGIN{printf "%+.3f", a-b}')
+PCT=$(awk -v a="$DEV_NS" -v b="$BASE_NS" 'BEGIN{printf "%+.2f", (a-b)/b*100}')
+
+SUMMARY="LLVM \`${LLVM_HASH}\` on \`${SYSTEM}\`: **${DEV_NS} ns/day** (baseline ${BASE_NS}, delta ${DELTA}, **${PCT}%**) [reset@${RESETSTEP}/${STEPS}]"
+echo "$SUMMARY"
+notify "$SUMMARY"
