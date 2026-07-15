@@ -30,7 +30,7 @@ done
 [ -d "$GMX_SRC" ] || { echo "error: GROMACS sources missing at $GMX_SRC — run clone-sources.sh first" >&2; exit 1; }
 
 # Shared HIP compile flags (from the captured dev CMake cache).
-HIP_FLAGS="--rocm-path=$ROCM_ROOT --offload-arch=$GPU_ARCH -fPIC -ffast-math -munsafe-fp-atomics -fdenormal-fp-math=ieee -fcuda-flush-denormals-to-zero -Wno-unused-command-line-argument -Wno-pass-failed -mllvm -amdgpu-assume-32bit-global-offset"
+HIP_FLAGS="--rocm-path=$ROCM_ROOT --offload-arch=$GPU_ARCH -fPIC -ffast-math -munsafe-fp-atomics -fdenormal-fp-math=ieee -fcuda-flush-denormals-to-zero -Wno-unused-command-line-argument -Wno-pass-failed"
 
 if [ "$FLAVOR" = "dev" ]; then
   [ -x "$LLVM_BUILD/bin/clang++" ] || { echo "error: custom clang++ missing at $LLVM_BUILD/bin — run build-llvm.sh first" >&2; exit 1; }
@@ -75,6 +75,17 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     -DGMX_USE_RDTSCP=ON \
     -DHIPCC_HAS_TARGET_ARCH_gfx1201=TRUE \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
+elif [ "$FLAVOR" = "dev" ]; then
+  # Incremental builds reuse CMakeCache but INSTALL_NAME gets a fresh
+  # timestamp each run. Keep CMAKE_INSTALL_PREFIX in sync so install and
+  # the dev-current symlink target the same directory.
+  CACHED_PREFIX=$(grep -E '^CMAKE_INSTALL_PREFIX:PATH=' "$BUILD_DIR/CMakeCache.txt" | cut -d= -f2-)
+  if [ "$CACHED_PREFIX" != "$INSTALL_PREFIX" ]; then
+    echo "=== updating install prefix ==="
+    echo "  was: $CACHED_PREFIX"
+    echo "  now: $INSTALL_PREFIX"
+    cmake -S "$GMX_SRC" -B "$BUILD_DIR" -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX"
+  fi
 fi
 
 if [ "$CLEAN" -eq 1 ]; then

@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# emit-device-ir [target.o ...] - generate AMDGPU device LLVM IR (and, with
+# --isa, gfx ISA) for selected GROMACS kernel translation units.
+#
+# It reuses the *exact* compile command ninja would run for each object file
+# (same defines, include paths, and HIP flags as the real build), then re-runs
+# it in device-only mode to emit IR instead of an object. This guarantees the
+# IR matches what the dev build actually compiles.
+#
+# For every translation unit it writes, into $WORK_DIR/ir/:
+#   <stem>.device.ll         optimized device IR (post -O3 LLVM passes)
+#   <stem>.device.preopt.ll  frontend IR with LLVM passes disabled
+#                            (feed to `opt` to watch optimization passes)
+#   <stem>.gfx<arch>.s       gfx ISA (only with --isa; feed IR to `llc` to
+#                            watch codegen passes instead)
+#
+# Usage:
+#   emit-device-ir                 # default: pme_spread + nbnxm kernels
+#   emit-device-ir --isa           # also emit gfx ISA
+#   emit-device-ir <t1.o> <t2.o>   # explicit ninja object targets
+#
+# Inspect passes afterwards, e.g.:
+#   opt -O3 -print-after-all  $WORK_DIR/ir/pme_spread_hip.device.preopt.ll  -o /dev/null
+#   llc -mcpu=$GPU_ARCH -print-after-all $WORK_DIR/ir/pme_spread_hip.device.ll -o /dev/null
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=/dev/null
+. "$HERE/config.sh"
+
+BUILD_DIR="$GMX_BUILD_DIR"
+OUT_DIR="$WORK_DIR/ir"
+EMIT_ISA=0
+
+TARGETS=()
+for arg in "$@"; do
+  case "$arg" in
+    --isa)     EMIT_ISA=1 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)         TARGETS+=("$arg") ;;
+  esac
+done
+
+# Default kernel translation units: PME spline+spread and the NBNXM force /
+# prune-only kernels. Object-file paths as ninja knows them.
+if [ "${#TARGETS[@]}" -eq 0 ]; then
+  TARGETS=(
+    src/gromacs/CMakeFiles/libgromacs.dir/ewald/pme_spread_hip.cpp.o
+    src/gromacs/CMakeFiles/libgromacs.dir/nbnxm/hip/nbnxm_hip_kernel_body_fv_prune.cpp.o
+    src/gromacs/CMakeFiles/libgromacs.dir/nbnxm/hip/nbnxm_hip_kernel_body_f_noprune.cpp.o
+    src/gromacs/CMakeFiles/libgromacs.dir/nbnxm/hip/nbnxm_hip_kernel_pruneonly.cpp.o
+  )
+fi
+
+[ -f "$BUILD_DIR/build.ninja" ] || { echo "error: no ninja build at $BUILD_DIR — run build-gromacs.sh dev first" >&2; exit 1; }
+mkdir -p "$OUT_DIR"
+
+echo "=== emitting device IR (arch $GPU_ARCH) -> $OUT_DIR ==="
+
+for tgt in "${TARGETS[@]}"; do
+  cmd="$(ninja -C "$BUILD_DIR" -t commands "$tgt" 2>/dev/null | tail -1)"
+  [ -z "$cmd" ] && { echo "  WARNING: no compile command for $tgt — skipping" >&2; continue; }
+
+  src="$(awk '{print $NF}' <<<"$cmd")"
+  stem="$(basename "$src")"; stem="${stem%.*}"
+
+  # Strip dependency-file generation and the object output/compile flags so we
+  # can redirect to IR/ISA outputs instead.
+  base_cmd="$(sed -E \
+      -e 's/ -MD//' \
+      -e 's/ -MT [^ ]+//' \
+      -e 's/ -MF [^ ]+//' \
+      -e 's# -o [^ ]+\.o##' \
+      -e 's/ -c / /' \
+      <<<"$cmd")"
+
+  echo "--- $stem"
+  # ninja runs commands from the build dir; keep that cwd for relative -I paths.
+  ( cd "$BUILD_DIR"
+
+    echo "    optimized IR   -> $stem.device.ll"
+    # shellcheck disable=SC2086
+    $base_cmd --cuda-device-only -emit-llvm -S -o "$OUT_DIR/$stem.device.ll"
+
+    echo "    pre-opt IR     -> $stem.device.preopt.ll"
+    # shellcheck disable=SC2086
+    $base_cmd --cuda-device-only -emit-llvm -S -Xclang -disable-llvm-passes \
+        -o "$OUT_DIR/$stem.device.preopt.ll"
+
+    if [ "$EMIT_ISA" -eq 1 ]; then
+      echo "    gfx ISA        -> $stem.$GPU_ARCH.s"
+      # shellcheck disable=SC2086
+      $base_cmd --cuda-device-only -S -o "$OUT_DIR/$stem.$GPU_ARCH.s"
+    fi
+  )
+done
+
+echo ""
+echo "Device IR written to: $OUT_DIR"
+ls -lh "$OUT_DIR"
